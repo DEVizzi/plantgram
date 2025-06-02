@@ -2,12 +2,19 @@ name: Automated Instagram Plant Post
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Runs daily at 6:00 AM UTC
+    # Six peak global engagement times (UTC)
+    - cron: "30 5 * * *"   # 05:30 UTC (morning in Asia, evening in US West)
+    - cron: "00 8 * * *"   # 08:00 UTC (morning in Europe, late evening in Asia)
+    - cron: "30 11 * * *"  # 11:30 UTC (morning US East, afternoon Europe)
+    - cron: "00 15 * * *"  # 15:00 UTC (afternoon US East, evening Europe)
+    - cron: "30 18 * * *"  # 18:30 UTC (evening US, late night Europe)
+    - cron: "00 22 * * *"  # 22:00 UTC (evening US West, morning in Asia)
   workflow_dispatch:
 
 jobs:
   post:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -22,10 +29,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Automation Script
+      - name: Prepare Google API Key (optional)
+        if: ${{ env.GOOGLE_API_KEY != '' }}
+        run: |
+          echo "GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }}" >> $GITHUB_ENV
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+      - name: Run Automation Script
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
-          INSTAGRAM_PASSWORD: ${{ secrets.INSTAGRAM_PASSWORD }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+
         run: python main.py
+
+      - name: 💾 Commit updated history.txt
+        run: |
+          git config --global user.name 'github-actions'
+          git config --global user.email 'github-actions@github.com'
+          git add history.txt
+          git commit -m "Update history.txt [skip ci]" || echo "No changes to commit"
+          git push
