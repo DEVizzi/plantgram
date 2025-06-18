@@ -3,12 +3,39 @@ name: Automated Instagram Plant Post
 on:
   schedule:
     # Six peak global engagement times (UTC)
-    - cron: "30 5 * * *"   # 05:30 UTC (morning in Asia, evening in US West)
-    - cron: "00 8 * * *"   # 08:00 UTC (morning in Europe, late evening in Asia)
-    - cron: "30 11 * * *"  # 11:30 UTC (morning US East, afternoon Europe)
-    - cron: "00 15 * * *"  # 15:00 UTC (afternoon US East, evening Europe)
-    - cron: "30 18 * * *"  # 18:30 UTC (evening US, late night Europe)
-    - cron: "00 22 * * *"  # 22:00 UTC (evening US West, morning in Asia)
+   # - cron: "30 1 * * 1"  # 7:00 AM IST
+# - cron: "30 7 * * 1"  # 1:00 PM IST
+# - cron: "30 14 * * 1" # 8:00 PM IST
+
+# Tuesday
+# - cron: "30 2 * * 2"  # 8:00 AM IST
+# - cron: "30 8 * * 2"  # 2:00 PM IST
+# - cron: "30 15 * * 2" # 9:00 PM IST
+
+# Wednesday
+# - cron: "30 1 * * 3"  # 7:00 AM IST
+# - cron: "30 7 * * 3"  # 1:00 PM IST
+# - cron: "30 14 * * 3" # 8:00 PM IST
+
+# Thursday
+# - cron: "30 2 * * 4"  # 8:00 AM IST
+# - cron: "30 8 * * 4"  # 2:00 PM IST
+# - cron: "30 15 * * 4" # 9:00 PM IST
+
+# Friday
+# - cron: "30 1 * * 5"  # 7:00 AM IST
+# - cron: "30 7 * * 5"  # 1:00 PM IST
+# - cron: "30 14 * * 5" # 8:00 PM IST
+
+# Saturday
+# - cron: "30 3 * * 6"  # 9:00 AM IST
+# - cron: "30 9 * * 6"  # 3:00 PM IST
+# - cron: "30 16 * * 6" # 10:00 PM IST
+
+# Sunday
+# - cron: "30 2 * * 0"  # 8:00 AM IST
+# - cron: "30 8 * * 0"  # 2:00 PM IST
+# - cron: "30 15 * * 0" # 9:00 PM IST
   workflow_dispatch:
 
 jobs:
