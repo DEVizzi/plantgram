@@ -3,26 +3,7 @@ name: Automated Instagram Plant Post
 on:
   schedule:
     # Monday to Sunday — 10:00 AM IST and 7:30 PM IST
-    - cron: "30 4 * * 1"  # 10:00 AM IST Monday
-    - cron: "0 14 * * 1"  # 7:30 PM IST Monday
-
-    - cron: "30 4 * * 2"  # 10:00 AM IST Tuesday
-    - cron: "0 14 * * 2"  # 7:30 PM IST Tuesday
-
-    - cron: "30 4 * * 3"  # 10:00 AM IST Wednesday
-    - cron: "0 14 * * 3"  # 7:30 PM IST Wednesday
-
-    - cron: "30 4 * * 4"  # 10:00 AM IST Thursday
-    - cron: "0 14 * * 4"  # 7:30 PM IST Thursday
-
-    - cron: "30 4 * * 5"  # 10:00 AM IST Friday
-    - cron: "0 14 * * 5"  # 7:30 PM IST Friday
-
-    - cron: "30 4 * * 6"  # 10:00 AM IST Saturday
-    - cron: "0 14 * * 6"  # 7:30 PM IST Saturday
-
-    - cron: "30 4 * * 0"  # 10:00 AM IST Sunday
-    - cron: "0 14 * * 0"  # 7:30 PM IST Sunday
+    #- cron: "30 4 * * 1"  # 10:00 AM IST Monday
 
   workflow_dispatch:
 
