@@ -471,6 +471,27 @@ def ensure_long_lived_ig_token() -> str:
     return ACCESS_TOKEN
 
 
+def wait_for_media_container(container_id: str, max_wait_seconds: int = 120, poll_interval: int = 3) -> None:
+    """
+    Polls the Instagram Graph API container status until it is FINISHED processing.
+    Prevents Graph API error 9007 ('Media ID is not available') on publish.
+    """
+    endpoint = f"{BASE_URL}/{container_id}"
+    params = {"fields": "status_code,status", "access_token": ACCESS_TOKEN}
+    elapsed = 0
+    while elapsed < max_wait_seconds:
+        resp = requests.get(endpoint, params=params, timeout=HTTP_TIMEOUT).json()
+        status_code = resp.get("status_code")
+        print(f"⏳ Instagram container {container_id} status: {status_code or resp}")
+        if status_code == "FINISHED":
+            return
+        if status_code in ("ERROR", "EXPIRED"):
+            raise RuntimeError(f"Instagram media container processing failed: {resp}")
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+    raise TimeoutError(f"Timed out waiting for Instagram container {container_id} to finish processing.")
+
+
 def publish_photo(image_url: str, caption: str) -> dict:
     """
     Uploads an image to Instagram via Graph API v19.0 and publishes it.
@@ -493,7 +514,10 @@ def publish_photo(image_url: str, caption: str) -> dict:
     container_id = resp.json().get("id")
     print("✅ media container id:", container_id)
 
-    # 2. Publish the container
+    # 2. Wait for container to finish processing before publishing
+    wait_for_media_container(container_id)
+
+    # 3. Publish the container
     publish_endpoint = f"{BASE_URL}/{IG_USER_ID}/media_publish"
     publish_payload = {
         "creation_id": container_id,
