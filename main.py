@@ -206,119 +206,312 @@ HOOK_LIST = [
 ]
 
 
-def search_plant_image(query: str) -> str:
-    """
-    Returns a URL of a potted indoor plant image based on the given plant name.
-    Tries Unsplash first (HD), falls back to Pexels. Then falls back to generic terms.
-    Avoids duplicates using history.txt.
-    """
+BANNED_IMAGE_KEYWORDS = {
+    "illustration", "vector", "drawing", "artificial", "render", "3d", "toy",
+    "fake", "vessel", "cartoon", "clipart", "logo", "text", "watermark",
+}
+PLANT_KEYWORDS = {
+    "plant", "leaf", "leaves", "foliage", "greenery", "houseplant",
+    "indoor", "pot", "potted", "planter", "botanical", "succulent", "fern", "cactus",
+}
+AESTHETIC_BONUS_KEYWORDS = {
+    "sunlight", "window", "minimalist", "aesthetic", "monstera", "living room",
+    "ceramic", "terracotta", "morning light", "close up", "macro",
+}
 
-    UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
-    PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 
-    if not UNSPLASH_ACCESS_KEY or not PEXELS_API_KEY:
-        raise ValueError("Missing API keys for Unsplash or Pexels in environment variables.")
-
-    pot_keywords = {"pot", "potted", "planter", "flowerpot"}
-    plant_keywords = {"plant", "leaf", "leaves", "foliage", "greenery", "houseplant", "indoor plant"}
-    banned_keywords = {"illustration", "vector", "drawing", "artificial", "render", "3d", "toy", "fake", "vessel"}
-
-    # NEW fallback list
-    fallback_terms = [query, "indoor plant", "potted plant", "succulent"]
-
-    def is_valid_metadata(text, is_fallback=False):
-        text = text.lower()
-        if any(bad in text for bad in banned_keywords):
-            return False
-        if not is_fallback and not any(good in text for good in pot_keywords):
-            return False
-        if not any(good in text for good in plant_keywords):
-            return False
+def _is_valid_plant_metadata(text: str) -> bool:
+    lower = (text or "").lower()
+    if any(bad in lower for bad in BANNED_IMAGE_KEYWORDS):
+        return False
+    if not lower.strip():
         return True
+    return any(good in lower for good in PLANT_KEYWORDS)
 
-    def fetch_unsplash_image(search_term: str, is_fallback=False):
-        params = {
-            "query": f"{search_term} pot indoor",
-            "client_id": UNSPLASH_ACCESS_KEY,
-            "per_page": 30,
-            "orientation": "portrait",
-            "content_filter": "high"
-        }
-        url = "https://api.unsplash.com/search/photos"
-        resp = requests.get(url, params=params)
+
+def score_image_candidate(cand: dict) -> float:
+    """
+    Fast, zero-download heuristic score (0..100+) prioritizing:
+    1. Instagram 4:5 portrait aspect ratio (height/width ~ 1.25)
+    2. High resolution (>= 1080px wide)
+    3. Community likes/downloads (Unsplash/Pixabay social proof)
+    4. Botanical/aesthetic keyword relevance
+    """
+    w = cand.get("width") or 1000
+    h = cand.get("height") or 1250
+    ratio = h / max(w, 1)
+
+    # Best score near 1.25 (4:5 portrait); penalize landscape (< 0.95)
+    if ratio < 0.95:
+        aspect_score = -25.0
+    else:
+        aspect_score = max(0.0, 35.0 - abs(ratio - 1.25) * 30.0)
+
+    res_score = min(w / 1080.0, 1.5) * 20.0
+    likes = cand.get("likes") or 0
+    popularity_score = min(likes, 4000) / 80.0  # up to +50 pts
+
+    desc = (cand.get("description") or "").lower()
+    aesthetic_hits = sum(1 for kw in AESTHETIC_BONUS_KEYWORDS if kw in desc)
+    keyword_score = min(aesthetic_hits * 4.0, 16.0)
+
+    return aspect_score + res_score + popularity_score + keyword_score
+
+
+def fetch_unsplash_candidates(search_term: str, per_page: int = 30) -> list:
+    key = os.getenv("UNSPLASH_ACCESS_KEY")
+    if not key:
+        return []
+    params = {
+        "query": search_term,
+        "client_id": key,
+        "per_page": per_page,
+        "orientation": "portrait",
+        "content_filter": "high",
+    }
+    try:
+        resp = requests.get("https://api.unsplash.com/search/photos", params=params, timeout=15)
         if resp.status_code != 200:
-            print(f"Unsplash error: {resp.status_code}")
-            return None
-
-        results = resp.json().get("results", [])
-        random.shuffle(results)
-        for img in results:
+            return []
+        out = []
+        for img in resp.json().get("results", []):
+            url_hd = (img.get("urls") or {}).get("regular") or (img.get("urls") or {}).get("full")
+            if not url_hd or is_duplicate_image(url_hd):
+                continue
             alt = img.get("alt_description") or ""
             desc = img.get("description") or ""
-            tags_text = " ".join([t["title"] for t in img.get("tags", []) if "title" in t])
-            metadata = f"{alt} {desc} {tags_text}"
-            url_hd = img["urls"].get("full")
-            if not url_hd:
+            tags_text = " ".join(t["title"] for t in img.get("tags", []) if isinstance(t, dict) and "title" in t)
+            meta = f"{alt} {desc} {tags_text}"
+            if not _is_valid_plant_metadata(meta):
                 continue
+            out.append({
+                "url": url_hd,
+                "width": img.get("width") or 1080,
+                "height": img.get("height") or 1350,
+                "likes": img.get("likes") or 0,
+                "description": meta,
+                "source": "unsplash",
+            })
+        return out
+    except Exception as e:
+        print(f"⚠️ Unsplash error: {e}")
+        return []
 
-            if is_valid_metadata(metadata, is_fallback=is_fallback) and not is_duplicate_image(url_hd):
-                save_image_to_history(url_hd)
-                return url_hd
-        return None
 
-    def fetch_pexels_image(search_term: str, is_fallback=False):
-        headers = {"Authorization": PEXELS_API_KEY}
-        params = {
-            "query": f"{search_term} pot indoor",
-            "orientation": "portrait",
-            "size": "large",
-            "per_page": 30
-        }
-        url = "https://api.pexels.com/v1/search"
-        resp = requests.get(url, headers=headers, params=params)
+def fetch_pexels_candidates(search_term: str, per_page: int = 30) -> list:
+    key = os.getenv("PEXELS_API_KEY")
+    if not key:
+        return []
+    headers = {"Authorization": key}
+    params = {"query": search_term, "orientation": "portrait", "size": "large", "per_page": per_page}
+    try:
+        resp = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
         if resp.status_code != 200:
-            print(f"Pexels error: {resp.status_code}")
-            return None
+            return []
+        out = []
+        for photo in resp.json().get("photos", []):
+            src = photo.get("src") or {}
+            url_hd = src.get("large2x") or src.get("original")
+            if not url_hd or is_duplicate_image(url_hd):
+                continue
+            desc = photo.get("alt") or ""
+            if not _is_valid_plant_metadata(desc):
+                continue
+            out.append({
+                "url": url_hd,
+                "width": photo.get("width") or 1080,
+                "height": photo.get("height") or 1350,
+                "likes": 40,
+                "description": desc,
+                "source": "pexels",
+            })
+        return out
+    except Exception as e:
+        print(f"⚠️ Pexels error: {e}")
+        return []
 
-        photos = resp.json().get("photos", [])
-        random.shuffle(photos)
-        for photo in photos:
-            desc = (photo.get("alt") or "").lower()
-            url_hd = photo["src"].get("original")
+
+def fetch_pixabay_candidates(search_term: str, per_page: int = 30) -> list:
+    key = os.getenv("PIXABAY_API_KEY")
+    if not key:
+        return []
+    params = {
+        "key": key,
+        "q": search_term,
+        "image_type": "photo",
+        "orientation": "vertical",
+        "safesearch": "true",
+        "per_page": per_page,
+    }
+    try:
+        resp = requests.get("https://pixabay.com/api/", params=params, timeout=15)
+        if resp.status_code != 200:
+            return []
+        out = []
+        for hit in resp.json().get("hits", []):
+            url_hd = hit.get("largeImageURL") or hit.get("fullHDURL")
             if not url_hd:
                 continue
+            pid = f"pixabay-{hit.get('id')}"
+            if is_duplicate_image(pid):
+                continue
+            tags = hit.get("tags") or ""
+            if not _is_valid_plant_metadata(tags):
+                continue
+            likes = (hit.get("likes") or 0) + (hit.get("downloads") or 0) // 25
+            out.append({
+                "url": url_hd,
+                "history_id": pid,
+                "width": hit.get("imageWidth") or 1080,
+                "height": hit.get("imageHeight") or 1350,
+                "likes": likes,
+                "description": tags,
+                "source": "pixabay",
+            })
+        return out
+    except Exception as e:
+        print(f"⚠️ Pixabay error: {e}")
+        return []
 
-            if is_valid_metadata(desc, is_fallback=is_fallback) and not is_duplicate_image(url_hd):
-                save_image_to_history(url_hd)
-                return url_hd
-        return None
 
-    for i, term in enumerate(fallback_terms):
-        is_fallback = (i > 0)
-        img_url = fetch_unsplash_image(term, is_fallback=is_fallback)
-        if img_url:
-            print(f"✅ Image found on Unsplash for '{term}'")
-            return img_url
+def fetch_inaturalist_candidates(plant_name: str, per_page: int = 12) -> list:
+    """
+    Free CC0/CC-BY research-grade botanical photography from iNaturalist API (no key required).
+    Great for rare plants not found in stock libraries.
+    """
+    params = {
+        "q": plant_name,
+        "quality_grade": "research",
+        "photos": "true",
+        "photo_license": "cc0,cc-by",
+        "per_page": per_page,
+    }
+    try:
+        resp = requests.get("https://api.inaturalist.org/v1/observations", params=params, timeout=15)
+        if resp.status_code != 200:
+            return []
+        out = []
+        for obs in resp.json().get("results", []):
+            for photo in obs.get("photos", [])[:1]:
+                raw_url = photo.get("url") or ""
+                if not raw_url:
+                    continue
+                large_url = raw_url.replace("square.", "large.").replace("medium.", "large.")
+                pid = f"inat-{photo.get('id')}"
+                if is_duplicate_image(pid):
+                    continue
+                dims = photo.get("original_dimensions") or {}
+                out.append({
+                    "url": large_url,
+                    "history_id": pid,
+                    "width": dims.get("width") or 1024,
+                    "height": dims.get("height") or 1280,
+                    "likes": (obs.get("faves_count") or 0) * 15,
+                    "description": f"{plant_name} botanical leaf plant",
+                    "source": "inaturalist",
+                })
+        return out
+    except Exception as e:
+        print(f"⚠️ iNaturalist error: {e}")
+        return []
 
-        img_url = fetch_pexels_image(term, is_fallback=is_fallback)
-        if img_url:
-            print(f"✅ Image found on Pexels for '{term}'")
-            return img_url
 
-    raise Exception(f"No HD image found for '{query}' or fallback terms via Unsplash or Pexels.")
-
-
-
-def is_duplicate_image(url: str, history_file: str = "history.txt") -> bool:
-    image_id = extract_image_id(url)
-    if not os.path.exists(history_file):
+def check_image_aesthetics(image_path: str) -> bool:
+    """
+    Fast (<0.15s) OpenCV quality gate: rejects blurry, tiny, or poorly exposed photos.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
         return False
-    with open(history_file, "r") as f:
+    h, w = img.shape[:2]
+    if min(w, h) < 700:
+        return False
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mean_luma = float(np.mean(gray))
+    if mean_luma < 35.0 or mean_luma > 235.0:
+        return False
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return sharpness >= 35.0
+
+
+def select_best_plant_image(plant_name: str, output_dir: str = "output") -> tuple:
+    """
+    Gathers free plant photos from Unsplash, Pexels, Pixabay (and iNaturalist fallback),
+    ranks them in <1s by 4:5 portrait fit, resolution, and popularity, and verifies the top
+    candidate with a fast OpenCV sharpness/exposure check before recording it in history.txt.
+    Returns (selected_url, local_path, source_name).
+    """
+    queries = [
+        f"{plant_name} aesthetic houseplant",
+        f"{plant_name} indoor plant",
+        f"sunlit houseplant indoor pot",
+    ]
+    all_candidates = []
+    seen_ids = set()
+
+    for q_idx, q in enumerate(queries):
+        batch = []
+        batch.extend(fetch_unsplash_candidates(q, per_page=20))
+        batch.extend(fetch_pexels_candidates(q, per_page=20))
+        batch.extend(fetch_pixabay_candidates(q, per_page=20))
+        if q_idx == 0 and len(batch) < 4:
+            batch.extend(fetch_inaturalist_candidates(plant_name, per_page=10))
+
+        for c in batch:
+            cid = c.get("history_id") or extract_image_id(c["url"])
+            if cid not in seen_ids and not is_duplicate_image(cid):
+                seen_ids.add(cid)
+                c["history_id"] = cid
+                c["score"] = score_image_candidate(c)
+                all_candidates.append(c)
+
+        if len(all_candidates) >= 12:
+            break
+
+    if not all_candidates:
+        raise RuntimeError(f"No unique HD plant image found for '{plant_name}'.")
+
+    all_candidates.sort(key=lambda c: c["score"], reverse=True)
+    print(f"🔍 Ranked {len(all_candidates)} unique candidates for '{plant_name}' (top score: {all_candidates[0]['score']:.1f} from {all_candidates[0]['source']})")
+
+    for cand in all_candidates[:3]:
+        local_path = save_image_locally(cand["url"], plant_name, output_dir=output_dir)
+        if not local_path:
+            continue
+        if check_image_aesthetics(local_path):
+            save_image_to_history(cand["history_id"])
+            print(f"✅ Selected best image ({cand['source']}, score={cand['score']:.1f}): {cand['url']}")
+            return cand["url"], local_path, cand["source"]
+        print(f"⚠️ Candidate failed fast quality gate, trying next...")
+
+    # Fallback: use top downloaded candidate if all 3 failed strict threshold
+    fallback = all_candidates[0]
+    local_path = save_image_locally(fallback["url"], plant_name, output_dir=output_dir)
+    if not local_path:
+        raise RuntimeError(f"Failed to download selected image for '{plant_name}'.")
+    save_image_to_history(fallback["history_id"])
+    return fallback["url"], local_path, fallback["source"]
+
+
+def search_plant_image(query: str) -> str:
+    """Backwards-compatible helper returning the best image URL."""
+    url, _, _ = select_best_plant_image(query)
+    return url
+
+
+def is_duplicate_image(url_or_id: str, history_file: str = "history.txt") -> bool:
+    image_id = extract_image_id(url_or_id) if "://" in url_or_id else url_or_id.strip()
+    history_path = history_file if os.path.isabs(history_file) else os.path.join(BASE_DIR, history_file)
+    if not os.path.exists(history_path):
+        return False
+    with open(history_path, "r", encoding="utf-8") as f:
         return image_id.strip() in (line.strip() for line in f.readlines())
 
-def save_image_to_history(url: str, history_file: str = "history.txt"):
-    image_id = extract_image_id(url)
-    with open(history_file, "a") as f:
+
+def save_image_to_history(url_or_id: str, history_file: str = "history.txt"):
+    image_id = extract_image_id(url_or_id) if "://" in url_or_id else url_or_id.strip()
+    history_path = history_file if os.path.isabs(history_file) else os.path.join(BASE_DIR, history_file)
+    with open(history_path, "a", encoding="utf-8") as f:
         f.write(image_id.strip() + "\n")
 
 
@@ -536,34 +729,42 @@ def build_query(plant_name):
 
 def generate_caption(plant: str, image_url: str) -> str:
     """
-    Use Gemini to create a caption with emojis and hashtags for the given plant.
-    Adds consistent brand hashtags and formatting.
+    Generates an engagement-optimized Instagram caption designed for saves, comments,
+    and follower growth (Hook -> Save-Worthy Care Tip -> Comment Question -> Clean Hashtags).
     """
-    hook = random.choice(HOOK_LIST)
-    prompt = (
-        f"Line 1: A catchy hook—embellish this seed hook with relevant emojis: \"{hook}\".\n"
-        f"Line 2: A fun fact about \"{plant}\" followed by 3–5 trending plant hashtags.\n"
-        f"Keep the entire caption under 1000 characters, with no extra labels or commentary."
-    )
+    prompt = f"""
+You are a top botanical Instagram growth strategist for @blurry_plant_love (a fast-growing houseplant community).
+
+Write a high-engagement caption for a stunning photo of "{plant}" with this exact structure:
+1. HOOK LINE: One short, intriguing, relatable or surprising sentence about {plant} (with 1-2 fitting emojis).
+2. CARE SECRET (SAVE-WORTHY): A blank line, then "🌱 Care Secret:" followed by 2 crisp, practical sentences on how to make {plant} thrive (light, watering, humidity, or propagation tip people want to save).
+3. COMMENT PROMPT: A blank line, then one easy-to-answer question asking readers about their experience with {plant} (e.g., "Do you have one in your collection, or is it still on your wishlist? 👇").
+
+Rules:
+- Plain text only (no markdown asterisks **, no HTML).
+- Keep the body under 700 characters so it is punchy and easy to read.
+- Do NOT include hashtags (I will append curated hashtags separately).
+    """
 
     messages = [
-        SystemMessage(content="You are a witty Instagram content creator for plant lovers."),
+        SystemMessage(content="You write viral, save-worthy Instagram captions for houseplant lovers."),
         HumanMessage(content=prompt)
     ]
     response = llm.invoke(messages)
-    gemini_caption = response.content.strip()
+    gemini_caption = re.sub(r"[*_`]", "", response.content.strip())
 
-    final_caption = f"""{gemini_caption}
+    plant_tag = "#" + re.sub(r"[^a-zA-Z0-9]", "", plant).lower()
+    curated_tags = " ".join(dict.fromkeys([
+        plant_tag,
+        "#houseplants", "#plantcare", "#urbanjungle",
+        "#indoorplants", "#plantlover", "#plantcommunity", "#botanical",
+    ]))
 
-☘️✨🌿 ———————————— 🌿✨☘️
-💚 Follow 👉 @blurry_plant_love for rare plant moments, green vibes & daily leafy joy!
-📸 Share this post with your favorite plant parent 🌱
-🪴 Save for plantspiration!
-☘️✨🌿 ———————————— 🌿✨☘️
-
-#plantsmakepeoplehappy #plantsofinstagram #houseplants #indoorplants #urbanjungle #plantlover #plantstagram #plantsplantsplants #houseplantclub #plantsarefriends #houseplantjournal #plantparenthood #greeninterior #livingwithplants #myplantlovinghome #plantladyisthenewcatlady #ihavethisthingwithplants #rareplants #plantshop #plantcollection #plantlove #plantcommunity #greenthumb #botanical #greenery #succulents #cactus #gardening #naturelovers #homedecor
-"""
-
+    final_caption = (
+        f"{gemini_caption}\n\n"
+        f"🪴 Save this tip for later & follow @blurry_plant_love for daily plant care + green inspiration.\n\n"
+        f"{curated_tags}"
+    )
     return final_caption
 
 
@@ -580,9 +781,11 @@ def save_image_locally(image_image_url: str, plant_name: str, output_dir: str = 
     output_path = os.path.join(output_dir, file_name)
 
     try:
-        img_data = requests.get(image_image_url, timeout=HTTP_TIMEOUT).content
+        headers = {"User-Agent": "PlantgramBot/1.0"}
+        resp = requests.get(image_image_url, headers=headers, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
         with open(output_path, "wb") as out_file:
-            out_file.write(img_data)
+            out_file.write(resp.content)
         print(f"Image saved locally at: {output_path}")
         return output_path
     except Exception as e:
@@ -590,26 +793,45 @@ def save_image_locally(image_image_url: str, plant_name: str, output_dir: str = 
         return ""
 
 
-def enhance_plant_image(input_path, output_path):
+def enhance_plant_image(input_path: str, output_path: str) -> None:
+    """
+    Frames the photo to Instagram's optimal 4:5 portrait (1080x1350) for maximum feed
+    real estate, and applies subtle, natural botanical color grading.
+    """
     image = cv2.imread(input_path)
+    if image is None:
+        raise RuntimeError(f"Could not read image at {input_path}")
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
+    # Subtle natural green vibrancy (avoids artificial neon look)
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-
     h, s, v = cv2.split(hsv)
     mask_green = (h > 35) & (h < 90)
-    s[mask_green] = np.clip(s[mask_green] * 1.5, 0, 255).astype(np.uint8)
-
-    hsv_enhanced = cv2.merge([h, s, v])
-    enhanced_rgb = cv2.cvtColor(hsv_enhanced, cv2.COLOR_HSV2RGB)
+    s[mask_green] = np.clip(s[mask_green] * 1.18, 0, 255).astype(np.uint8)
+    enhanced_rgb = cv2.cvtColor(cv2.merge([h, s, v]), cv2.COLOR_HSV2RGB)
 
     img = Image.fromarray(enhanced_rgb)
-    img = ImageEnhance.Brightness(img).enhance(1.1)
-    img = ImageEnhance.Contrast(img).enhance(1.3)
-    img = ImageEnhance.Sharpness(img).enhance(2.0)
 
-    img.save(output_path)
-    print(f"Enhanced image saved to {output_path}")
+    # Center-crop to 4:5 portrait (0.8 aspect ratio) and resize to 1080x1350
+    w, h_px = img.size
+    target_ratio = 4 / 5
+    current_ratio = w / max(h_px, 1)
+    if current_ratio > target_ratio:
+        new_w = int(h_px * target_ratio)
+        left = (w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, h_px))
+    elif current_ratio < target_ratio:
+        new_h = int(w / target_ratio)
+        top = (h_px - new_h) // 2
+        img = img.crop((0, top, w, top + new_h))
+
+    img = img.resize((1080, 1350), Image.LANCZOS)
+    img = ImageEnhance.Brightness(img).enhance(1.04)
+    img = ImageEnhance.Contrast(img).enhance(1.12)
+    img = ImageEnhance.Sharpness(img).enhance(1.25)
+
+    img.save(output_path, quality=95)
+    print(f"Enhanced 4:5 image saved to {output_path}")
 
 
 def upload_to_cloudinary(local_path: str) -> str:
@@ -619,14 +841,20 @@ def upload_to_cloudinary(local_path: str) -> str:
 
 def extract_image_id(url: str) -> str:
     """
-    Extracts a unique image ID from Unsplash or Pexels URLs.
-    - Unsplash: photo-1519836627919-5b9a1653d03b
-    - Pexels:   pexels-photo-7959572
+    Extracts a unique image ID from Unsplash, Pexels, Pixabay, or iNaturalist URLs.
     """
     if "unsplash.com" in url:
         match = re.search(r"(photo-\w+)", url)
     elif "pexels.com" in url:
         match = re.search(r"(pexels-photo-\d+)", url)
+    elif "pixabay.com" in url:
+        match = re.search(r"(\d+)_\d+", url)
+        if match:
+            return f"pixabay-{match.group(1)}"
+    elif "inaturalist" in url:
+        match = re.search(r"/photos/(\d+)/", url)
+        if match:
+            return f"inat-{match.group(1)}"
     else:
         match = None
 
@@ -636,23 +864,16 @@ def extract_image_id(url: str) -> str:
 # Main execution
 if __name__ == "__main__":
     plant_name = random.choice(PLANT_LIST)
-    plant_query = build_query(plant_name)
     print(f"Selected plant: {plant_name}")
-    print(f"Selected query: {plant_query}")
 
-    image_url = search_plant_image(plant_query)
-    print(f"Fetched image URL: {image_url}")
+    image_url, local_image_path, source_name = select_best_plant_image(plant_name)
+    print(f"Best image ({source_name}): {image_url}")
 
     caption = generate_caption(plant_name, image_url)
-    print(f"Generated caption: {caption}")
-
-    local_image_path = save_image_locally(image_url, plant_name)
-    if not local_image_path:
-        raise RuntimeError("❌ Failed to download plant image locally.")
+    print(f"Generated caption:\n{caption}")
 
     enhanced_path = local_image_path.replace(".jpg", "_enhanced.jpg")
     enhance_plant_image(local_image_path, enhanced_path)
-    print(f"Enhanced image saved at: {enhanced_path}")
 
     cloudinary_url = upload_to_cloudinary(enhanced_path)
 

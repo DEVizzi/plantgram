@@ -28,6 +28,38 @@ class TestPlantgram(unittest.TestCase):
             plantgram.extract_image_id("https://images.pexels.com/photos/7959572/pexels-photo-7959572.jpeg"),
             "pexels-photo-7959572",
         )
+        self.assertEqual(
+            plantgram.extract_image_id("https://cdn.pixabay.com/photo/2020/04/12/123456_1280.jpg"),
+            "pixabay-123456",
+        )
+        self.assertEqual(
+            plantgram.extract_image_id("https://inaturalist-open-data.s3.amazonaws.com/photos/987654/large.jpg"),
+            "inat-987654",
+        )
+
+    def test_score_image_candidate_prefers_4_5_portrait_and_likes(self):
+        portrait_popular = {"width": 1080, "height": 1350, "likes": 1200, "description": "sunlight monstera leaf"}
+        landscape_plain = {"width": 1920, "height": 1080, "likes": 10, "description": "plant"}
+        self.assertGreater(
+            plantgram.score_image_candidate(portrait_popular),
+            plantgram.score_image_candidate(landscape_plain),
+        )
+
+    @patch("main.requests.get")
+    def test_fetch_inaturalist_candidates(self, mock_get):
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "results": [{
+                "faves_count": 5,
+                "photos": [{"id": 555111, "url": "https://static.inaturalist.org/photos/555111/medium.jpg"}],
+            }]
+        }
+        mock_get.return_value = mock_resp
+        with patch("main.is_duplicate_image", return_value=False):
+            cands = plantgram.fetch_inaturalist_candidates("Monstera")
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["history_id"], "inat-555111")
+        self.assertIn("large.jpg", cands[0]["url"])
 
     @patch("main.requests.get")
     def test_ensure_long_lived_ig_token_permanent_page_token(self, mock_get):
