@@ -1,26 +1,22 @@
 import os
+import re
+import time
 import random
 import requests
+from datetime import datetime
 from dotenv import load_dotenv
-from langchain.tools import tool
-from instagrapi import Client
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema import HumanMessage
-import pickle
-from langchain.schema import SystemMessage, HumanMessage
-from instagrapi import Client
 import cloudinary
+import cloudinary.uploader
 import cv2
 import numpy as np
 from PIL import Image, ImageEnhance
-import cloudinary
-import cloudinary.uploader
-from datetime import datetime
-import re
-from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_URL = "https://graph.facebook.com/v19.0"
+HTTP_TIMEOUT = 60
 
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
@@ -29,12 +25,57 @@ cloudinary.config(
 )
 
 # Instagram Graph API credentials
-ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")  # Long-lived Instagram Graph API token
+ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")  # Permanent Page token (or long-lived token)
 IG_USER_ID = os.getenv("IG_USER_ID")        # Your Instagram Business Account ID
 
-# Initialize Gemini Chat Model with a supported model name
+
+class SystemMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class HumanMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _GeminiResponse:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class ChatGoogleGenerativeAI:
+    def __init__(self, model: str = "models/gemini-flash-lite-latest", temperature: float = 0.7):
+        self.model = model if model.startswith("models/") else f"models/{model}"
+        self.temperature = temperature
+
+    def invoke(self, messages: list) -> _GeminiResponse:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY environment variable is not set.")
+        sys_parts = [m.content for m in messages if isinstance(m, SystemMessage)]
+        user_parts = [m.content for m in messages if not isinstance(m, SystemMessage)]
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": "\n\n".join(user_parts)}]}],
+            "generationConfig": {"temperature": self.temperature},
+        }
+        if sys_parts:
+            payload["systemInstruction"] = {"parts": [{"text": "\n".join(sys_parts)}]}
+        for candidate_model in (self.model, "models/gemini-3.1-flash-lite", "models/gemini-flash-latest"):
+            url = f"https://generativelanguage.googleapis.com/v1beta/{candidate_model}:generateContent?key={api_key}"
+            resp = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return _GeminiResponse(text)
+        resp.raise_for_status()
+
+
+# Initialize Gemini Chat Model
 llm = ChatGoogleGenerativeAI(
-    model="models/gemini-1.5-flash",
+    model="models/gemini-flash-lite-latest",
     temperature=0.7
 )
 
@@ -165,7 +206,6 @@ HOOK_LIST = [
 ]
 
 
-@tool
 def search_plant_image(query: str) -> str:
     """
     Returns a URL of a potted indoor plant image based on the given plant name.
@@ -331,50 +371,145 @@ def limit_hashtags(caption: str) -> str:
 # List of plants, hook list, and helper functions (search_plant_image, generate_caption, build_query) go here
 # ... [Keep your existing search_plant_image and generate_caption implementations]
 
+def _persist_env_var(key: str, value: str) -> None:
+    """Updates a key=value entry in the local .env file if it exists."""
+    env_file = os.path.join(BASE_DIR, ".env")
+    if not os.path.exists(env_file):
+        return
+    with open(env_file, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    updated = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = f"{key}={value}"
+            updated = True
+            break
+    if not updated:
+        lines.append(f"{key}={value}")
+    with open(env_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def ensure_long_lived_ig_token() -> str:
+    """
+    Checks IG_ACCESS_TOKEN expiration via /debug_token.
+    - If expires_at == 0, it is already a permanent non-expiring Page token.
+    - If < 45 days remain (or it is a User token) and FB_APP_ID/FB_APP_SECRET are set,
+      automatically exchanges for a 60-day User token and derives a permanent
+      non-expiring Page Access Token (expires_at == 0) via /me/accounts.
+    """
+    global ACCESS_TOKEN
+    if not ACCESS_TOKEN:
+        return ""
+
+    fb_app_id = os.getenv("FB_APP_ID", "")
+    fb_app_secret = os.getenv("FB_APP_SECRET", "")
+    app_token = f"{fb_app_id}|{fb_app_secret}" if (fb_app_id and fb_app_secret) else ACCESS_TOKEN
+
+    try:
+        dbg_resp = requests.get(
+            f"{BASE_URL}/debug_token",
+            params={"input_token": ACCESS_TOKEN, "access_token": app_token},
+            timeout=HTTP_TIMEOUT,
+        ).json()
+        data = dbg_resp.get("data", {})
+        is_valid = data.get("is_valid", False)
+        expires_at = data.get("expires_at")
+
+        if not is_valid:
+            print(f"⚠️ Instagram token is invalid/expired: {data.get('error', dbg_resp)}")
+            return ACCESS_TOKEN
+
+        if expires_at == 0:
+            print("🔒 Instagram token is a permanent non-expiring Page token.")
+            return ACCESS_TOKEN
+
+        remaining_days = (expires_at - time.time()) / 86400 if expires_at else 0
+        print(f"🔑 Instagram token expires in {remaining_days:.1f} days.")
+
+        if remaining_days < 45 and fb_app_id and fb_app_secret:
+            print("🔄 Exchanging/refreshing Instagram token for a permanent Page token...")
+            source_token = os.getenv("IG_USER_TOKEN") or ACCESS_TOKEN
+            ex_resp = requests.get(
+                f"{BASE_URL}/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": fb_app_id,
+                    "client_secret": fb_app_secret,
+                    "fb_exchange_token": source_token,
+                },
+                timeout=HTTP_TIMEOUT,
+            ).json()
+            long_user_token = ex_resp.get("access_token")
+            if long_user_token:
+                _persist_env_var("IG_USER_TOKEN", long_user_token)
+                os.environ["IG_USER_TOKEN"] = long_user_token
+                final_token = long_user_token
+
+                pages_resp = requests.get(
+                    f"{BASE_URL}/me/accounts",
+                    params={
+                        "fields": "id,name,access_token,instagram_business_account",
+                        "access_token": long_user_token,
+                    },
+                    timeout=HTTP_TIMEOUT,
+                ).json()
+                for page in pages_resp.get("data", []):
+                    ig_acct = (page.get("instagram_business_account") or {}).get("id")
+                    if ig_acct == IG_USER_ID and page.get("access_token"):
+                        final_token = page["access_token"]
+                        print("✅ Obtained permanent non-expiring Page/Instagram access token via /me/accounts!")
+                        break
+
+                ACCESS_TOKEN = final_token
+                os.environ["IG_ACCESS_TOKEN"] = final_token
+                _persist_env_var("IG_ACCESS_TOKEN", final_token)
+                print("✅ Refreshed IG_ACCESS_TOKEN saved to .env.")
+    except Exception as e:
+        print(f"⚠️ Instagram token check/refresh warning: {e}")
+
+    return ACCESS_TOKEN
+
+
 def publish_photo(image_url: str, caption: str) -> dict:
     """
-    Uploads an image to Instagram via Graph API and publishes it.
+    Uploads an image to Instagram via Graph API v19.0 and publishes it.
     Returns the API response as a dict.
     """
-    # Enforce hashtag limit
+    ensure_long_lived_ig_token()
     caption = limit_hashtags(caption)
     print(f"Generated caption after limit: {caption}")
+
     # 1. Create a media container
-    create_endpoint = f"https://graph.facebook.com/v17.0/{IG_USER_ID}/media"
+    create_endpoint = f"{BASE_URL}/{IG_USER_ID}/media"
     create_payload = {
         "image_url": image_url,
         "caption": caption,
         "access_token": ACCESS_TOKEN
     }
-    resp = requests.post(create_endpoint, data=create_payload)
+    resp = requests.post(create_endpoint, data=create_payload, timeout=HTTP_TIMEOUT)
     if resp.status_code != 200:
-        print("❌ create-media error:", resp.json())
-        return resp.json()
+        raise RuntimeError(f"❌ create-media error: {resp.json()}")
     container_id = resp.json().get("id")
     print("✅ media container id:", container_id)
 
     # 2. Publish the container
-    publish_endpoint = f"https://graph.facebook.com/v17.0/{IG_USER_ID}/media_publish"
+    publish_endpoint = f"{BASE_URL}/{IG_USER_ID}/media_publish"
     publish_payload = {
         "creation_id": container_id,
         "access_token": ACCESS_TOKEN
     }
-    pub_resp = requests.post(publish_endpoint, data=publish_payload)
+    pub_resp = requests.post(publish_endpoint, data=publish_payload, timeout=HTTP_TIMEOUT)
     if pub_resp.status_code != 200:
-        print("❌ publish-media error:", pub_resp.json())
-        return pub_resp.json()
+        raise RuntimeError(f"❌ publish-media error: {pub_resp.json()}")
     print("✅ publish success:", pub_resp.json())
     return pub_resp.json()
 
 
-
 def build_query(plant_name):
-    # We include the plant name and additional keywords for context
-    # e.g. "Monstera deliciosa indoor plant pot"
     return f"{plant_name} indoor pot"
 
-# Function: Generate Instagram Caption using Gemini
-@tool
+
 def generate_caption(plant: str, image_url: str) -> str:
     """
     Use Gemini to create a caption with emojis and hashtags for the given plant.
@@ -416,13 +551,12 @@ def save_image_locally(image_image_url: str, plant_name: str, output_dir: str = 
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Generate timestamp and format filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_name = f"{plant_name.replace(' ', '_').lower()}_{timestamp}.jpg"
     output_path = os.path.join(output_dir, file_name)
 
     try:
-        img_data = requests.get(image_url).content
+        img_data = requests.get(image_image_url, timeout=HTTP_TIMEOUT).content
         with open(output_path, "wb") as out_file:
             out_file.write(img_data)
         print(f"Image saved locally at: {output_path}")
@@ -433,34 +567,31 @@ def save_image_locally(image_image_url: str, plant_name: str, output_dir: str = 
 
 
 def enhance_plant_image(input_path, output_path):
-    # Read image using OpenCV
     image = cv2.imread(input_path)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    # Convert to HSV to enhance green colors
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
 
-    # Boost saturation for green hues
     h, s, v = cv2.split(hsv)
-    mask_green = (h > 35) & (h < 90)  # green hue range
+    mask_green = (h > 35) & (h < 90)
     s[mask_green] = np.clip(s[mask_green] * 1.5, 0, 255).astype(np.uint8)
 
     hsv_enhanced = cv2.merge([h, s, v])
     enhanced_rgb = cv2.cvtColor(hsv_enhanced, cv2.COLOR_HSV2RGB)
 
-    # Convert to PIL for brightness/contrast/sharpness
     img = Image.fromarray(enhanced_rgb)
     img = ImageEnhance.Brightness(img).enhance(1.1)
     img = ImageEnhance.Contrast(img).enhance(1.3)
     img = ImageEnhance.Sharpness(img).enhance(2.0)
 
-    # Save the enhanced image
     img.save(output_path)
     print(f"Enhanced image saved to {output_path}")
+
 
 def upload_to_cloudinary(local_path: str) -> str:
     result = cloudinary.uploader.upload(local_path)
     return result["secure_url"]
+
 
 def extract_image_id(url: str) -> str:
     """
@@ -477,36 +608,30 @@ def extract_image_id(url: str) -> str:
 
     return match.group(1) if match else url.split("/")[-1].split("?")[0]
 
+
 # Main execution
 if __name__ == "__main__":
-    # 1. Select a random plant
     plant_name = random.choice(PLANT_LIST)
-    plant_query=build_query(plant_name)
+    plant_query = build_query(plant_name)
     print(f"Selected plant: {plant_name}")
-    print(f"Selected plant: {plant_query}")
+    print(f"Selected query: {plant_query}")
 
-    # 2. Fetch image URL
     image_url = search_plant_image(plant_query)
     print(f"Fetched image URL: {image_url}")
 
-    # 3. Generate caption
-    caption = generate_caption.invoke({"plant": plant_name, "image_url": image_url})
+    caption = generate_caption(plant_name, image_url)
     print(f"Generated caption: {caption}")
 
-    # 4. Save image locally
     local_image_path = save_image_locally(image_url, plant_name)
+    if not local_image_path:
+        raise RuntimeError("❌ Failed to download plant image locally.")
 
-    # 4.1 Enhance the image before upload
     enhanced_path = local_image_path.replace(".jpg", "_enhanced.jpg")
     enhance_plant_image(local_image_path, enhanced_path)
     print(f"Enhanced image saved at: {enhanced_path}")
 
-    # 5. Upload enhanced image to Cloudinary
     cloudinary_url = upload_to_cloudinary(enhanced_path)
 
-    # 6. Publish using Imgur URL
     result = publish_photo(cloudinary_url, caption)
     print(f"Post published: {result}")
-
-["link"]
 
